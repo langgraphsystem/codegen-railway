@@ -13,4 +13,4 @@ echo "OUTPUT_DIR=${OUTPUT_DIR:-/data/code}"         >> .env
 mkdir -p /data /data/sessions /data/code
 
 # Старт API на порту, который задаёт Railway
-exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8000}"
+exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8080}"
