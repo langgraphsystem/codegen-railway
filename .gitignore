@@ -1,0 +1,22 @@
+# env и секреты
+.env
+**/.env
+
+# питоновский мусор
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# системы/IDE
+.DS_Store
+.vscode/
+.idea/
+.venv/
+venv/
+
+# артефакты версий/вывода на рантайме
+sessions/
+code/
+/data/
