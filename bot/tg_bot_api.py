@@ -3,11 +3,16 @@
 """
 Telegram Codegen Bot (API client)
 
+Изменения:
+- Промпты принимаются ТОЛЬКО как .txt-документы (большие тексты не дробятся Telegram'ом).
+- Очередь задач на чат. Команда /cancel очищает все ОЖИДАЮЩИЕ задачи в очереди.
+  (Текущий выполняющийся запрос не прерывается; после его завершения очередь уже будет пустой.)
+
 Возможности:
 - Несколько файлов/типов (например: code.py, langgraph.py, web/index.html).
 - Версионирование: sessions/<chat>/<session>/vNNN.<ext> + latest.<ext>.
-- Команды: /use (или /file), /files, /history, /get, /rollback, /bundle, /model, /lang, /state.
-- Для правок можно прислать промпт + код в блоке из трёх обратных кавычек (triple backticks).
+- Команды: /use (или /file), /files, /history, /get, /rollback, /bundle, /model, /lang, /state, /queue, /cancel.
+- Для правок по-прежнему можно прислать ПРОМПТ + код в блоке из трёх обратных кавычек (triple backticks) В .TXT ФАЙЛЕ.
 
 Требуется внешний API /generate (FastAPI из каталога api/).
 Секреты и URL — ТОЛЬКО из .env (на Railway он собирается в start.sh).
@@ -22,6 +27,7 @@ import difflib
 import zipfile
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
+from collections import defaultdict, deque
 
 import requests
 from dotenv import dotenv_values
@@ -45,6 +51,9 @@ DEFAULT_LANGUAGE  = (CFG.get("DEFAULT_LANGUAGE") or "python").strip()
 DEFAULT_FILE_NAME = (CFG.get("DEFAULT_FILE_NAME") or "code.py").strip()
 SESSIONS_ROOT     = Path(CFG.get("SESSIONS_DIR") or "/data/sessions"); SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT       = Path(CFG.get("OUTPUT_DIR") or "/data/code");       OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+# лимиты на текстовые файлы промптов (чтобы не убить API)
+MAX_PROMPT_TXT_BYTES = int((CFG.get("MAX_PROMPT_TXT_BYTES") or "262144"))  # 256KB по умолчанию
 
 # ─────────── Авто-язык по расширению ───────────
 EXT_LANG = {
@@ -179,24 +188,34 @@ def save_state(chat_id: int, st: Dict[str, str]) -> None:
     state_file(chat_id).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
     touch_manifest_entry(chat_id, st["file_name"])
 
+# ─────────── Очередь задач (на чат) ───────────
+JOB_QUEUES: dict[int, deque] = defaultdict(deque)
+PROCESSING: set[int] = set()   # сейчас обрабатывается
+
+def queue_size(chat_id: int) -> int:
+    return len(JOB_QUEUES[chat_id])
+
 # ─────────── HELP ───────────
 HELP = (
     "Я генерирую/обновляю файлы кода через API и веду версии.\n\n"
+    "⚠️ Отправляйте ПРОМПТ только в виде .txt файла (Document). Текстовые сообщения как промпт не принимаю.\n\n"
     "Основное:\n"
     "• /use <путь/имя> — выбрать файл (напр. /use code.py или /use web/index.html)\n"
-    "• Присылай ПРОМПТ — создам/обновлю файл и пришлю готовый.\n"
+    "• Пришлите .txt файл с промптом — создам/обновлю файл и пришлю готовый.\n"
     "  Если есть предыдущая версия — применю правки к latest автоматически.\n"
-    "• Можно прислать ПРОМПТ + код в блоке из трёх обратных кавычек — правки от присланной версии.\n\n"
+    "• Можно положить в .txt ПРОМПТ + внизу код в блоке из трёх обратных кавычек — правки от конкретной версии.\n\n"
     "Навигация:\n"
     "• /files — список файлов\n"
     "• /history [file] — показать версии\n"
     "• /get [file] [vNNN|latest] — прислать указанную версию\n"
     "• /rollback vNNN — сделать выбранную версию новой latest (для текущего файла)\n\n"
-    "Настройки:\n"
+    "Настройки и очередь:\n"
     "• /model <id>   — выбрать модель (по умолчанию gpt-5)\n"
     "• /lang <name>  — подсказка языка (python, javascript, ...)\n"
     "• /state        — показать текущие настройки\n"
     "• /bundle [all] — ZIP: последние версии всех файлов (или все версии)\n"
+    "• /queue        — показать длину очереди\n"
+    "• /cancel       — очистить все ОЖИДАЮЩИЕ задачи в очереди\n"
 )
 
 # ─────────── Команды ───────────
@@ -247,7 +266,7 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = list_files_summary(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("Пока нет файлов. Используй /use <file> и пришли промпт.")
+        await update.message.reply_text("Пока нет файлов. Используй /use <file> и пришли .txt с промптом.")
         return
     await update.message.reply_text("Файлы:\n" + "\n".join(rows))
 
@@ -343,14 +362,20 @@ async def cmd_bundle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption=("Последние версии всех файлов" if latest_only else "Все версии всех файлов")
         )
 
-# ─────────── Основная обработка промптов ───────────
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text or ""
-    prompt, injected_code = parse_msg(text)
-    if not prompt:
-        await update.message.reply_text("Дай спецификацию (промпт)."); return
+async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = queue_size(update.effective_chat.id)
+    await update.message.reply_text(f"В очереди задач: {n}")
 
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    n = queue_size(chat_id)
+    JOB_QUEUES[chat_id].clear()
+    await update.message.reply_text(f"Очередь очищена. Удалено ожидающих задач: {n}\n"
+                                    f"(Текущая выполняющаяся задача, если есть, завершится как обычно.)")
+
+# ─────────── ВНУТРЕННЕЕ: постановка в очередь и обработка ───────────
+async def enqueue_job(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, prompt: str, injected_code: Optional[str]):
+    chat_id = update.effective_chat.id
     st = load_state(chat_id)
     sid, ext = touch_manifest_entry(chat_id, st["file_name"])
 
@@ -362,67 +387,135 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             base_code = lp.read_text(encoding="utf-8")
     mode = "edit" if base_code else "create"
 
-    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    JOB_QUEUES[chat_id].append({
+        "sid": sid, "ext": ext, "mode": mode,
+        "language": st["language"], "model": st["model"],
+        "prompt": prompt, "base_code": base_code,
+        "file_name": st["file_name"]
+    })
+
+    await update.message.reply_text(f"Задача поставлена в очередь. Всего в очереди: {queue_size(chat_id)}")
+    if chat_id not in PROCESSING:
+        await run_queue(update, ctx)
+
+async def run_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in PROCESSING:
+        return
+    PROCESSING.add(chat_id)
     try:
-        r = requests.post(
-            f"{CODEGEN_API_URL}/generate",
-            headers={"Content-Type": "application/json"},
-            json={
-                "prompt": prompt,
-                "base_code": base_code,
-                "mode": mode,
-                "language": st["language"],
-                "model": st["model"],
-                "session_id": sid,
-                "ext": ext
-            },
-            timeout=180
-        )
-        if r.status_code != 200:
-            raise RuntimeError(f"{r.status_code}: {r.text}")
-        data = r.json()
-        code = data.get("code", "")
-        if not code:
-            raise RuntimeError("API не вернул поле 'code'")
-        diff = data.get("diff")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка API: {e}")
+        while JOB_QUEUES[chat_id]:
+            job = JOB_QUEUES[chat_id].popleft()
+            sid = job["sid"]; ext = job["ext"]; mode = job["mode"]
+            language = job["language"]; model = job["model"]
+            prompt = job["prompt"]; base_code = job["base_code"]
+            file_name = job["file_name"]
+
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            try:
+                r = requests.post(
+                    f"{CODEGEN_API_URL}/generate",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "prompt": prompt,
+                        "base_code": base_code,
+                        "mode": mode,
+                        "language": language,
+                        "model": model,
+                        "session_id": sid,
+                        "ext": ext
+                    },
+                    timeout=180
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(f"{r.status_code}: {r.text}")
+                data = r.json()
+                code = data.get("code", "")
+                if not code:
+                    raise RuntimeError("API не вернул поле 'code'")
+                diff = data.get("diff")
+            except Exception as e:
+                await ctx.bot.send_message(chat_id, f"Ошибка API: {e}")
+                continue
+
+            # сохранить новую версию и latest
+            vpath = next_version_path(chat_id, sid, ext)
+            vpath.write_text(code, encoding="utf-8")
+            latest = latest_path(chat_id, sid, ext)
+            latest.write_text(code, encoding="utf-8")
+            (OUTPUT_ROOT / f"{sid}-latest{ext}").write_text(code, encoding="utf-8")
+            ver_num = register_new_version(chat_id, sid, ext)
+
+            # diff, если не прислал API
+            if base_code and not diff:
+                diff = "\n".join(difflib.unified_diff(
+                    base_code.splitlines(), code.splitlines(),
+                    fromfile=f"before{ext}", tofile=f"after{ext}", lineterm=""
+                ))
+
+            basename = Path(file_name).name
+            with vpath.open("rb") as f:
+                await ctx.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f, filename=basename),
+                    caption=f"✅ {basename}  (session={sid}, v{ver_num:03d})"
+                )
+            if diff:
+                if len(diff) <= 3500:
+                    await ctx.bot.send_message(chat_id, f"Изменения:\n{diff[:3900]}")
+                else:
+                    dpath = vpath.with_suffix(".diff.txt")
+                    dpath.write_text(diff, encoding="utf-8")
+                    with dpath.open("rb") as f:
+                        await ctx.bot.send_document(
+                            chat_id=chat_id,
+                            document=InputFile(f, filename=f"{sid}.diff.txt"),
+                            caption="Изменения (diff)"
+                        )
+    finally:
+        PROCESSING.discard(chat_id)
+
+# ─────────── Обработчики сообщений ───────────
+
+# 1) Текстовые сообщения — больше НЕ принимаем как промпт
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚠️ Пришлите промпт как .txt-документ (Attach → File). "
+        "Это предотвращает разбиение длинного текста на части."
+    )
+
+# 2) Документы — принимаем только .txt, читаем содержимое и ставим в очередь
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        await update.message.reply_text("❌ Я принимаю промпты только в виде .txt файла.")
         return
 
-    # сохранить новую версию и latest
-    vpath = next_version_path(chat_id, sid, ext)
-    vpath.write_text(code, encoding="utf-8")
-    latest = latest_path(chat_id, sid, ext)
-    latest.write_text(code, encoding="utf-8")
-    (OUTPUT_ROOT / f"{sid}-latest{ext}").write_text(code, encoding="utf-8")
-    ver_num = register_new_version(chat_id, sid, ext)
-
-    # diff, если не прислал API
-    if base_code and not diff:
-        diff = "\n".join(difflib.unified_diff(
-            base_code.splitlines(), code.splitlines(),
-            fromfile=f"before{ext}", tofile=f"after{ext}", lineterm=""
-        ))
-
-    # отправка файла
-    basename = Path(st["file_name"]).name
-    with vpath.open("rb") as f:
-        await update.message.reply_document(
-            document=InputFile(f, filename=basename),
-            caption=f"✅ {basename}  (session={sid}, v{ver_num:03d})"
+    # ограничим размер, чтобы не убивать API
+    if doc.file_size and doc.file_size > MAX_PROMPT_TXT_BYTES:
+        await update.message.reply_text(
+            f"❌ Слишком большой файл промпта (> {MAX_PROMPT_TXT_BYTES // 1024} KB). "
+            "Сократите файл или разбейте задачу на несколько."
         )
+        return
 
-    if diff:
-        if len(diff) <= 3500:
-            await update.message.reply_text(f"Изменения:\n{diff[:3900]}")
-        else:
-            dpath = vpath.with_suffix(".diff.txt")
-            dpath.write_text(diff, encoding="utf-8")
-            with dpath.open("rb") as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=f"{sid}.diff.txt"),
-                    caption="Изменения (diff)"
-                )
+    fobj = await ctx.bot.get_file(doc.file_id)
+    bio = await fobj.download_as_bytearray()
+    try:
+        text = bytes(bio).decode("utf-8")
+    except UnicodeDecodeError:
+        text = bytes(bio).decode("utf-8", errors="ignore")
+
+    # распарсим: в .txt можно положить и промпт, и код в ```…``` для точных правок
+    prompt, injected_code = parse_msg(text)
+    if not prompt:
+        await update.message.reply_text("❌ В .txt не найден промпт (пустой файл?).")
+        return
+
+    await enqueue_job(update, ctx, prompt=prompt, injected_code=injected_code)
 
 # ─────────── main ───────────
 def main():
@@ -439,7 +532,13 @@ def main():
     app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("rollback", cmd_rollback))
     app.add_handler(CommandHandler("bundle", cmd_bundle))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # порядок важен: сначала DOCUMENT, затем TEXT (чтобы текст не перехватывал документы)
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
