@@ -46,7 +46,7 @@ SESSIONS_ROOT     = Path(CFG.get("SESSIONS_DIR") or "/data/sessions"); SESSIONS_
 OUTPUT_ROOT       = Path(CFG.get("OUTPUT_DIR") or "/data/code");       OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 # лимиты и таймауты
-MAX_PROMPT_TXT_BYTES = int((CFG.get("MAX_PROMPT_TXT_BYTES") or "300000"))  # 256KB
+MAX_PROMPT_TXT_BYTES = int((CFG.get("MAX_PROMPT_TXT_BYTES") or "350000"))  # 256KB
 BOT_REQUEST_TIMEOUT  = int((CFG.get("BOT_REQUEST_TIMEOUT") or "1000"))      # сек. ожидания ответа /generate
 
 # ─────────── Авто-язык по расширению ───────────
