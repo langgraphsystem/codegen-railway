@@ -6,16 +6,7 @@ Telegram Codegen Bot (API client)
 Изменения:
 - Промпты принимаются ТОЛЬКО как .txt-документы (большие тексты не дробятся Telegram'ом).
 - Очередь задач на чат. Команда /cancel очищает все ОЖИДАЮЩИЕ задачи в очереди.
-  (Текущий выполняющийся запрос не прерывается; после его завершения очередь уже будет пустой.)
-
-Возможности:
-- Несколько файлов/типов (например: code.py, langgraph.py, web/index.html).
-- Версионирование: sessions/<chat>/<session>/vNNN.<ext> + latest.<ext>.
-- Команды: /use (или /file), /files, /history, /get, /rollback, /bundle, /model, /lang, /state, /queue, /cancel.
-- Для правок по-прежнему можно прислать ПРОМПТ + код в блоке из трёх обратных кавычек (triple backticks) В .TXT ФАЙЛЕ.
-
-Требуется внешний API /generate (FastAPI из каталога api/).
-Секреты и URL — ТОЛЬКО из .env (на Railway он собирается в start.sh).
+- Таймаут запроса к API настраивается через .env (BOT_REQUEST_TIMEOUT), добавлены ретраи на 5xx/429.
 """
 from __future__ import annotations
 
@@ -30,6 +21,8 @@ from typing import Dict, Tuple, Optional, List
 from collections import defaultdict, deque
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import dotenv_values
 from telegram import Update, InputFile
 from telegram.constants import ChatAction
@@ -52,8 +45,9 @@ DEFAULT_FILE_NAME = (CFG.get("DEFAULT_FILE_NAME") or "code.py").strip()
 SESSIONS_ROOT     = Path(CFG.get("SESSIONS_DIR") or "/data/sessions"); SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT       = Path(CFG.get("OUTPUT_DIR") or "/data/code");       OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# лимиты на текстовые файлы промптов (чтобы не убить API)
-MAX_PROMPT_TXT_BYTES = int((CFG.get("MAX_PROMPT_TXT_BYTES") or "262144"))  # 256KB по умолчанию
+# лимиты и таймауты
+MAX_PROMPT_TXT_BYTES = int((CFG.get("MAX_PROMPT_TXT_BYTES") or "262144"))  # 256KB
+BOT_REQUEST_TIMEOUT  = int((CFG.get("BOT_REQUEST_TIMEOUT") or "120"))      # сек. ожидания ответа /generate
 
 # ─────────── Авто-язык по расширению ───────────
 EXT_LANG = {
@@ -190,7 +184,7 @@ def save_state(chat_id: int, st: Dict[str, str]) -> None:
 
 # ─────────── Очередь задач (на чат) ───────────
 JOB_QUEUES: dict[int, deque] = defaultdict(deque)
-PROCESSING: set[int] = set()   # сейчас обрабатывается
+PROCESSING: set[int] = set()
 
 def queue_size(chat_id: int) -> int:
     return len(JOB_QUEUES[chat_id])
@@ -370,8 +364,10 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     n = queue_size(chat_id)
     JOB_QUEUES[chat_id].clear()
-    await update.message.reply_text(f"Очередь очищена. Удалено ожидающих задач: {n}\n"
-                                    f"(Текущая выполняющаяся задача, если есть, завершится как обычно.)")
+    await update.message.reply_text(
+        f"Очередь очищена. Удалено ожидающих задач: {n}\n"
+        f"(Текущая выполняющаяся задача, если есть, завершится как обычно.)"
+    )
 
 # ─────────── ВНУТРЕННЕЕ: постановка в очередь и обработка ───────────
 async def enqueue_job(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, prompt: str, injected_code: Optional[str]):
@@ -379,7 +375,6 @@ async def enqueue_job(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, prompt:
     st = load_state(chat_id)
     sid, ext = touch_manifest_entry(chat_id, st["file_name"])
 
-    # база для правок: присланный код или latest
     base_code = injected_code
     if not base_code:
         lp = latest_path(chat_id, sid, ext)
@@ -404,6 +399,17 @@ async def run_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     PROCESSING.add(chat_id)
     try:
+        # сессия с ретраями
+        sess = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        sess.mount("https://", HTTPAdapter(max_retries=retries))
+        sess.mount("http://", HTTPAdapter(max_retries=retries))
+
         while JOB_QUEUES[chat_id]:
             job = JOB_QUEUES[chat_id].popleft()
             sid = job["sid"]; ext = job["ext"]; mode = job["mode"]
@@ -413,7 +419,7 @@ async def run_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             try:
-                r = requests.post(
+                r = sess.post(
                     f"{CODEGEN_API_URL}/generate",
                     headers={"Content-Type": "application/json"},
                     json={
@@ -425,8 +431,14 @@ async def run_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         "session_id": sid,
                         "ext": ext
                     },
-                    timeout=180
+                    timeout=BOT_REQUEST_TIMEOUT
                 )
+                if r.status_code == 504:
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "⏱️ API не успело ответить (таймаут). Упростите промпт/уменьшите прикреплённый код и попробуйте ещё раз."
+                    )
+                    continue
                 if r.status_code != 200:
                     raise RuntimeError(f"{r.status_code}: {r.text}")
                 data = r.json()
@@ -494,7 +506,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Я принимаю промпты только в виде .txt файла.")
         return
 
-    # ограничим размер, чтобы не убивать API
     if doc.file_size and doc.file_size > MAX_PROMPT_TXT_BYTES:
         await update.message.reply_text(
             f"❌ Слишком большой файл промпта (> {MAX_PROMPT_TXT_BYTES // 1024} KB). "
@@ -509,7 +520,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except UnicodeDecodeError:
         text = bytes(bio).decode("utf-8", errors="ignore")
 
-    # распарсим: в .txt можно положить и промпт, и код в ```…``` для точных правок
     prompt, injected_code = parse_msg(text)
     if not prompt:
         await update.message.reply_text("❌ В .txt не найден промпт (пустой файл?).")
@@ -524,7 +534,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("state", cmd_state))
     app.add_handler(CommandHandler("use", cmd_use))
-    app.add_handler(CommandHandler("file", cmd_file))  # alias
+    app.add_handler(CommandHandler("file", cmd_file))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("files", cmd_files))
@@ -535,7 +545,7 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # порядок важен: сначала DOCUMENT, затем TEXT (чтобы текст не перехватывал документы)
+    # порядок важен: сначала DOCUMENT, затем TEXT
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -543,3 +553,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
